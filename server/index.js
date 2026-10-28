@@ -11,6 +11,8 @@ import figlet from 'figlet';
 import https from 'https';
 import http from 'http';
 import dns from 'dns';
+import { AsyncLocalStorage } from 'node:async_hooks';
+import { randomBytes } from 'node:crypto';
 
 // Force IPv4 to avoid Docker Desktop networking issues
 dns.setDefaultResultOrder('ipv4first');
@@ -20,7 +22,80 @@ dotenv.config();
 const __filename = fileURLToPath(import.meta.url);
 const __dirname = path.dirname(__filename);
 
+const requestContext = new AsyncLocalStorage();
+const authSessions = new Map();
+const loginAttempts = new Map();
+const SESSION_TTL_MS = 8 * 60 * 60 * 1000;
+const LOGIN_WINDOW_MS = 15 * 60 * 1000;
+const LOGIN_MAX_ATTEMPTS = 10;
+const AUTH_COOKIE = 'querydog.sid';
+
+function readAuthCookie(req) {
+  const raw = req.headers.cookie || '';
+  const prefix = `${AUTH_COOKIE}=`;
+  const part = raw.split(';').map(v => v.trim()).find(v => v.startsWith(prefix));
+  return part ? part.slice(prefix.length) : null;
+}
+
+function clearAuthCookie(res, req) {
+  const secure = req.secure || req.headers['x-forwarded-proto'] === 'https';
+  res.setHeader(
+    'Set-Cookie',
+    `${AUTH_COOKIE}=; Path=/; HttpOnly; SameSite=Strict; Max-Age=0${secure ? '; Secure' : ''}`
+  );
+}
+
+function closeAuthSession(sid) {
+  const session = authSessions.get(sid);
+  if (!session) return;
+  authSessions.delete(sid);
+  if (session.client) session.client.close().catch(() => {});
+}
+
+function lookupAuthSession(req) {
+  const sid = readAuthCookie(req);
+  if (!sid) return null;
+  const session = authSessions.get(sid);
+  if (!session) return null;
+  if (session.expiresAt <= Date.now()) {
+    closeAuthSession(sid);
+    return null;
+  }
+  session.expiresAt = Date.now() + SESSION_TTL_MS;
+  return { sid, session };
+}
+
+function currentAdminUsernames() {
+  return (process.env.QUERYDOG_ADMIN_USERS || '')
+    .split(',')
+    .map(v => v.trim())
+    .filter(Boolean);
+}
+
+function isAdminSession(session) {
+  return Boolean(session && currentAdminUsernames().includes(session.username));
+}
+
+function isReadOnlySql(sql) {
+  const normalized = String(sql || '')
+    .replace(/\/\*[\s\S]*?\*\//g, ' ')
+    .replace(/--[^\r\n]*/g, ' ')
+    .trim();
+
+  if (!normalized || normalized.includes(';')) return false;
+
+  const first = normalized.match(/^([a-z]+)/i)?.[1]?.toUpperCase();
+  const allowed =
+    ['SELECT', 'SHOW', 'DESCRIBE', 'DESC', 'EXPLAIN'].includes(first) ||
+    (first === 'WITH' && /\bSELECT\b/i.test(normalized));
+
+  if (!allowed) return false;
+
+  return !/\b(INTO\s+(?:OUTFILE|DUMPFILE)|INSERT|UPDATE|DELETE|ALTER|DROP|TRUNCATE|CREATE|RENAME|ATTACH|DETACH|OPTIMIZE|SYSTEM|KILL|GRANT|REVOKE|BACKUP|RESTORE|SET|USE)\b/i.test(normalized);
+}
+
 const app = express();
+
 app.use(cors());
 app.use(express.json());
 
@@ -135,9 +210,30 @@ const environments = loadConfig();
 
 // Active environment state
 let activeEnvIndex = 0;
-let client = null;
+let defaultClient = null;
+const client = new Proxy(Object.create(null), {
+  get(_target, property) {
+    const activeClient = requestContext.getStore()?.client || defaultClient;
+    const value = activeClient?.[property];
+    return typeof value === 'function' ? value.bind(activeClient) : value;
+  },
+});
 let CLICKHOUSE_CLUSTER = null;
 let QUERIES_FOLDER = 'queries';
+
+function getCurrentEnvironmentIndex() {
+  return requestContext.getStore()?.envIndex ?? activeEnvIndex;
+}
+
+function getCurrentEnvironment() {
+  const session = requestContext.getStore();
+  return session?.environment || environments[activeEnvIndex];
+}
+
+function getCurrentCluster() {
+  const session = requestContext.getStore();
+  return session ? session.environment.cluster : CLICKHOUSE_CLUSTER;
+}
 
 function createClientForEnv(env) {
   const protocol = env.secure ? 'https' : 'http';
@@ -185,12 +281,12 @@ function switchEnvironment(index) {
   const protocol = env.secure ? 'https' : 'http';
 
   // Close previous client
-  if (client) {
-    client.close().catch(() => {});
+  if (defaultClient) {
+    defaultClient.close().catch(() => {});
   }
 
   activeEnvIndex = index;
-  client = createClientForEnv(env);
+  defaultClient = createClientForEnv(env);
   CLICKHOUSE_CLUSTER = env.cluster;
   QUERIES_FOLDER = env.queries_folder || 'queries';
 
@@ -199,6 +295,20 @@ function switchEnvironment(index) {
 
 // Initialize first environment
 switchEnvironment(0);
+
+// Server-only connection used by selected read-only Analytics endpoints.
+// The first configured DEV environment currently uses local_user.
+const analyticsServiceClients = environments.map(env => createClientForEnv(env));
+
+function shouldUseServiceAnalyticsClient(route) {
+  if (route.startsWith('/api/query-log')) return true;
+
+  return new Set([
+    '/api/metrics',
+    '/api/async-metrics',
+    '/api/events',
+  ]).has(route);
+}
 
 // Helper to check connection with timeout (6 seconds)
 // Uses SELECT 1 instead of ping because chproxy blocks ping requests
@@ -212,7 +322,10 @@ async function pingWithTimeout(timeoutMs = CONNECTION_TIMEOUT_MS) {
   ]);
 }
 
-const getQueriesPath = () => path.isAbsolute(QUERIES_FOLDER) ? QUERIES_FOLDER : path.join(process.cwd(), QUERIES_FOLDER);
+const getQueriesPath = () => {
+  const folder = requestContext.getStore()?.environment?.queries_folder || QUERIES_FOLDER;
+  return path.isAbsolute(folder) ? folder : path.join(process.cwd(), folder);
+};
 
 // ==================== ALERTS RUN-LOG STORE (in-memory) ====================
 // Process-local — loses history on container restart. Enough for the live
@@ -263,7 +376,7 @@ function getRunLog(type, filename, limit = 50) {
 // env vars when the active env can't be resolved from the config.
 function currentEnv() {
   try {
-    const active = Array.isArray(environments) ? environments[activeEnvIndex] : null;
+    const active = getCurrentEnvironment();
     if (active) {
       return {
         name: active.name,
@@ -352,10 +465,18 @@ function writeDescription(folder, sqlFilename, description) {
 
 // Helper to get system table reference - uses clusterAllReplicas() if cluster is configured
 function getSystemTable(tableName) {
-  if (CLICKHOUSE_CLUSTER) {
-    return `clusterAllReplicas('${CLICKHOUSE_CLUSTER}', system.${tableName})`;
+  const cluster = getCurrentCluster();
+  const source = cluster
+    ? `clusterAllReplicas('${cluster}', system.${tableName})`
+    : `system.${tableName}`;
+
+  const session = requestContext.getStore();
+  if (tableName === 'query_log' && session?.queryLogScoped) {
+    const username = String(session.username || '').replace(/'/g, "''");
+    return `(SELECT * FROM ${source} WHERE user = '${username}')`;
   }
-  return `system.${tableName}`;
+
+  return source;
 }
 
 // Wrap an async route handler so thrown errors propagate to the Express
@@ -372,6 +493,198 @@ function columnsHandler(systemTable) {
     res.json(await result.json());
   });
 }
+
+
+// Public authentication endpoints. Credentials are never returned to the browser.
+app.get('/api/auth/environments', (req, res) => {
+  res.set('Cache-Control', 'no-store');
+  res.json({
+    environments: environments.map((env, index) => ({
+      index,
+      name: env.name,
+    })),
+  });
+});
+
+app.get('/api/auth/session', (req, res) => {
+  res.set('Cache-Control', 'no-store');
+  const found = lookupAuthSession(req);
+  if (!found) {
+    clearAuthCookie(res, req);
+    return res.json({ authenticated: false });
+  }
+  const session = found.session;
+  res.set('Cache-Control', 'no-store');
+  res.json({
+    authenticated: true,
+    username: session.username,
+    role: isAdminSession(session) ? 'admin' : 'viewer',
+    environment: {
+      index: session.envIndex,
+      name: session.environment.name,
+      database: session.environment.database,
+    },
+  });
+});
+
+app.post('/api/auth/login', async (req, res) => {
+  res.set('Cache-Control', 'no-store');
+
+  const isHttps = req.secure || req.headers['x-forwarded-proto'] === 'https';
+  const allowInsecureHttp = process.env.QUERYDOG_ALLOW_INSECURE_HTTP === '1';
+  if (process.env.NODE_ENV === 'production' && !isHttps && !allowInsecureHttp) {
+    return res.status(400).json({ error: 'HTTPS is required to sign in.' });
+  }
+
+  const address = req.socket.remoteAddress || 'unknown';
+  const now = Date.now();
+  let attempts = loginAttempts.get(address);
+  if (!attempts || attempts.resetAt <= now) {
+    attempts = { count: 0, resetAt: now + LOGIN_WINDOW_MS };
+    loginAttempts.set(address, attempts);
+  }
+  if (attempts.count >= LOGIN_MAX_ATTEMPTS) {
+    return res.status(429).json({ error: 'Too many login attempts. Try again later.' });
+  }
+
+  const username = typeof req.body?.username === 'string' ? req.body.username.trim() : '';
+  const password = typeof req.body?.password === 'string' ? req.body.password : '';
+  const environmentIndex = Number(req.body?.environmentIndex);
+
+  if (!username || username.length > 128 || !password || password.length > 1024 ||
+      !Number.isInteger(environmentIndex) ||
+      environmentIndex < 0 || environmentIndex >= environments.length) {
+    attempts.count += 1;
+    return res.status(401).json({ error: 'Invalid credentials or environment.' });
+  }
+
+  const configuredEnv = environments[environmentIndex];
+  const loginEnv = { ...configuredEnv, user: username, password };
+  let loginClient = null;
+
+  try {
+    loginClient = createClientForEnv(loginEnv);
+    await Promise.race([
+      loginClient.query({ query: 'SELECT 1', format: 'JSONEachRow' }).then(r => r.json()),
+      new Promise((_, reject) => setTimeout(
+        () => reject(new Error('Connection timed out')),
+        CONNECTION_TIMEOUT_MS
+      )),
+    ]);
+
+    const sid = randomBytes(32).toString('hex');
+    const session = {
+      client: loginClient,
+      environment: loginEnv,
+      envIndex: environmentIndex,
+      username,
+      password,
+      expiresAt: Date.now() + SESSION_TTL_MS,
+    };
+    authSessions.set(sid, session);
+    loginAttempts.delete(address);
+
+    const secure = isHttps ? '; Secure' : '';
+    res.setHeader(
+      'Set-Cookie',
+      `${AUTH_COOKIE}=${sid}; Path=/; HttpOnly; SameSite=Strict; Max-Age=${SESSION_TTL_MS / 1000}${secure}`
+    );
+    return res.json({
+      authenticated: true,
+      username,
+      environment: { index: environmentIndex, name: configuredEnv.name },
+    });
+  } catch {
+    if (loginClient) loginClient.close().catch(() => {});
+    attempts.count += 1;
+    return res.status(401).json({ error: 'Invalid credentials or environment.' });
+  }
+});
+
+app.post('/api/auth/logout', (req, res) => {
+  const sid = readAuthCookie(req);
+  if (sid) closeAuthSession(sid);
+  clearAuthCookie(res, req);
+  res.json({ success: true });
+});
+
+// Remove inactive/expired in-memory sessions and close their ClickHouse clients.
+const sessionCleanupTimer = setInterval(() => {
+  const now = Date.now();
+  for (const [sid, session] of authSessions) {
+    if (session.expiresAt <= now) closeAuthSession(sid);
+  }
+}, 60 * 1000);
+sessionCleanupTimer.unref();
+
+// Protect every API except login/session discovery and the basic health endpoint.
+app.use('/api', (req, res, next) => {
+  const route = (req.originalUrl || '').split('?')[0];
+  const publicRoutes = new Set([
+    '/api/auth/environments',
+    '/api/auth/session',
+    '/api/auth/login',
+    '/api/auth/logout',
+    '/api/health',
+  ]);
+  if (publicRoutes.has(route)) return next();
+
+  const found = lookupAuthSession(req);
+  if (!found) {
+    return res.status(401).json({ error: 'Authentication required.' });
+  }
+
+  const session = found.session;
+  const adminOnlyPrefixes = [
+    '/api/users', '/api/grants', '/api/roles', '/api/role-grants',
+    '/api/current-roles', '/api/enabled-roles', '/api/quotas',
+    '/api/quota-usage', '/api/quota-limits', '/api/row-policies',
+    '/api/session-log', '/api/settings', '/api/cluster', '/api/clusters',
+    '/api/replicas', '/api/replication-queue', '/api/zookeeper',
+    '/api/query-views-log', '/api/text-log', '/api/textlog',
+  ];
+
+  const requiresAdmin =
+    route === '/api/config/info' ||
+    route === '/api/config/environments/full' ||
+    (route === '/api/config/environments' && req.method !== 'GET') ||
+    route.startsWith('/api/config/environments/') ||
+    route === '/api/environments/switch' ||
+    adminOnlyPrefixes.some(prefix =>
+      route === prefix || route.startsWith(`${prefix}/`)
+    );
+
+  if (requiresAdmin && !isAdminSession(session)) {
+    return res.status(403).json({
+      error: 'Administrator permission is required for this operation.',
+    });
+  }
+
+  const isMutation = ['POST', 'PUT', 'PATCH', 'DELETE'].includes(req.method);
+  const readOnlyPostRoutes = new Set([
+    '/api/query', '/api/explore', '/api/explain', '/api/table-stats',
+  ]);
+  const isReadOnlyPost =
+    req.method === 'POST' &&
+    (readOnlyPostRoutes.has(route) || route.startsWith('/api/explain/'));
+
+  if (!isAdminSession(session) && isMutation && !isReadOnlyPost) {
+    return res.status(403).json({
+      error: 'Read-only account: this operation is not permitted.',
+    });
+  }
+
+  let requestSession = session;
+  if (!isAdminSession(session) && shouldUseServiceAnalyticsClient(route)) {
+    requestSession = {
+      ...session,
+      client: analyticsServiceClients[session.envIndex] || analyticsServiceClients[0],
+      queryLogScoped: route.startsWith('/api/query-log'),
+    };
+  }
+
+  requestContext.run(requestSession, () => next());
+});
 
 // Health check endpoint - tests ClickHouse connection (6 second timeout)
 app.get('/api/health', async (req, res) => {
@@ -393,7 +706,7 @@ app.get('/api/health', async (req, res) => {
 
 // Connection info endpoint (6 second timeout)
 app.get('/api/connection-info', async (req, res) => {
-  const env = environments[activeEnvIndex];
+  const env = getCurrentEnvironment();
   try {
     await pingWithTimeout();
     res.json({
@@ -402,7 +715,7 @@ app.get('/api/connection-info', async (req, res) => {
       port: env.port,
       secure: env.secure,
       user: env.user,
-      cluster: CLICKHOUSE_CLUSTER || null,
+      cluster: getCurrentCluster() || null,
       connected: true
     });
   } catch (error) {
@@ -413,7 +726,7 @@ app.get('/api/connection-info', async (req, res) => {
       port: env.port,
       secure: env.secure,
       user: env.user,
-      cluster: CLICKHOUSE_CLUSTER || null,
+      cluster: getCurrentCluster() || null,
       connected: false,
       error: error.message
     });
@@ -424,7 +737,7 @@ app.get('/api/connection-info', async (req, res) => {
 app.get('/api/config/environments', (req, res) => {
   const envs = loadConfig({ quiet: true });
   res.json({
-    active: activeEnvIndex,
+    active: getCurrentEnvironmentIndex(),
     environments: envs.map((env, i) => ({
       index: i,
       name: env.name,
@@ -452,7 +765,7 @@ app.get('/api/environments', (req, res) => {
   reloadEnvironments();
 
   res.json({
-    active: activeEnvIndex,
+    active: getCurrentEnvironmentIndex(),
     environments: environments.map((env, i) => ({
       index: i,
       name: env.name,
@@ -464,40 +777,54 @@ app.get('/api/environments', (req, res) => {
   });
 });
 
-// Switch environment (6 second timeout)
+// Switch the current login's environment without changing other users.
 app.post('/api/environments/switch', async (req, res) => {
-  // Reload from disk to pick up any external config changes
-  reloadEnvironments();
+  const session = requestContext.getStore();
+  const index = Number(req.body?.index);
 
-  const { index } = req.body;
-  if (index === undefined || index < 0 || index >= environments.length) {
+  if (!Number.isInteger(index) || index < 0 || index >= environments.length) {
     return res.status(400).json({ error: 'Invalid environment index' });
   }
+
+  const baseEnv = environments[index];
+  const nextEnv = {
+    ...baseEnv,
+    user: session.username,
+    password: session.password,
+  };
+  let nextClient = null;
+
   try {
-    switchEnvironment(index);
-    // Test the new connection with timeout
-    await pingWithTimeout();
-    const env = environments[index];
+    nextClient = createClientForEnv(nextEnv);
+    const result = await Promise.race([
+      nextClient.query({ query: 'SELECT 1', format: 'JSONEachRow' }).then(r => r.json()),
+      new Promise((_, reject) => setTimeout(
+        () => reject(new Error('Connection timed out')),
+        CONNECTION_TIMEOUT_MS
+      )),
+    ]);
+
+    const previousClient = session.client;
+    session.client = nextClient;
+    session.environment = nextEnv;
+    session.envIndex = index;
+
+    if (previousClient) previousClient.close().catch(() => {});
+
     res.json({
-      name: env.name,
-      host: env.host,
-      port: env.port,
-      secure: env.secure,
-      user: env.user,
-      cluster: CLICKHOUSE_CLUSTER || null,
-      connected: true
+      name: nextEnv.name,
+      host: nextEnv.host,
+      port: nextEnv.port,
+      secure: nextEnv.secure,
+      user: session.username,
+      cluster: nextEnv.cluster || null,
+      connected: true,
     });
-  } catch (error) {
-    const env = environments[index];
+  } catch {
+    if (nextClient) nextClient.close().catch(() => {});
     res.status(503).json({
-      name: env.name,
-      host: env.host,
-      port: env.port,
-      secure: env.secure,
-      user: env.user,
-      cluster: CLICKHOUSE_CLUSTER || null,
       connected: false,
-      error: error.message
+      error: 'Could not connect to the selected ClickHouse environment.',
     });
   }
 });
@@ -552,7 +879,7 @@ function reloadEnvironments() {
 app.get('/api/config/environments/full', (req, res) => {
   const envs = loadConfig({ quiet: true });
   res.json({
-    active: activeEnvIndex,
+    active: getCurrentEnvironmentIndex(),
     environments: envs.map((env, i) => ({
       index: i,
       name: env.name,
@@ -977,11 +1304,13 @@ app.get('/api/query-log/columns', columnsHandler('query_log'));
 
 // Get time series data for chart
 app.get('/api/query-log/timeseries', async (req, res) => {
+  let query = '';
+  let params = {};
   try {
     const { start, end, bucket = 'minute', search, filters, rangeFilters } = req.query;
 
     let whereConditions = [];
-    const params = {};
+    params = {};
 
     applyQueryLogDateRange(start, end, bucket, whereConditions, params);
     applyQueryLogSearch(search, whereConditions, params);
@@ -1013,7 +1342,7 @@ app.get('/api/query-log/timeseries', async (req, res) => {
         truncFunc = 'toStartOfMinute(event_time)';
     }
 
-    const query = `
+    query = `
       SELECT
         ${truncFunc} as time,
         count() as count,
@@ -1483,11 +1812,73 @@ app.get('/api/parts/grouped', async (req, res) => {
     if (errorMessage.includes('Not enough privileges') ||
         errorMessage.includes('ACCESS_DENIED') ||
         error.code === 497 || error.code === '497') {
-      return res.status(403).json({
-        error: 'Access denied: You do not have permission to access system.parts',
-        details: errorMessage,
-        type: 'permission'
-      });
+      // Fallback to the logged-in user's visible tables without system.parts.
+      try {
+        const filterMap = req.query.filters
+          ? JSON.parse(String(req.query.filters))
+          : {};
+        const searchText = String(req.query.search || '').trim().toLowerCase();
+        const databaseFilters = Array.isArray(filterMap.database)
+          ? filterMap.database.map(String) : [];
+        const tableFilters = Array.isArray(filterMap.table)
+          ? filterMap.table.map(String) : [];
+
+        const dbResult = await client.query({
+          query: 'SHOW DATABASES',
+          format: 'JSONEachRow',
+        });
+        const databases = await dbResult.json();
+        const fallback = [];
+
+        for (const row of databases) {
+          const database = row.name;
+          if (!database || database === 'information_schema') continue;
+          if (databaseFilters.length && !databaseFilters.includes(database)) continue;
+
+          const quotedDatabase = '`' + database.replace(/`/g, '\\`') + '`';
+          let tables;
+
+          try {
+            const result = await client.query({
+              query: `SHOW TABLES FROM ${quotedDatabase}`,
+              format: 'JSONEachRow',
+            });
+            tables = await result.json();
+          } catch {
+            continue;
+          }
+
+          for (const tableRow of tables) {
+            const table = tableRow.name;
+            if (!table) continue;
+            if (tableFilters.length && !tableFilters.includes(String(table))) continue;
+            if (searchText &&
+                !`${database} ${table}`.toLowerCase().includes(searchText)) continue;
+
+            fallback.push({
+              database,
+              table,
+              engine_full: 'Unknown',
+              partition_count: 0,
+              part_count: 0,
+              total_rows: 0,
+              total_bytes: 0,
+              compressed_bytes: 0,
+              uncompressed_bytes: 0,
+              savings_pct: 0,
+              last_modification_time: null,
+            });
+          }
+        }
+
+        return res.json(fallback);
+      } catch (fallbackError) {
+        console.error('Grouped-table fallback failed:', fallbackError.message || fallbackError);
+        return res.status(403).json({
+          error: 'Unable to list tables visible to this account.',
+          type: 'permission',
+        });
+      }
     }
     if (errorMessage.includes('Unknown table') ||
         errorMessage.includes('doesn\'t exist') ||
@@ -2511,11 +2902,45 @@ app.get('/api/storage-policies/columns', columnsHandler('storage_policies'));
 
 // Get all databases
 app.get('/api/browser/databases', asyncHandler(async (req, res) => {
-  // Filter out lowercase information_schema (duplicate of INFORMATION_SCHEMA)
-  const query = `SELECT name, engine, data_path, metadata_path, uuid FROM system.databases WHERE name != 'information_schema' ORDER BY name`;
-  const result = await client.query({ query, format: 'JSONEachRow' });
-  const data = await result.json();
-  res.json(data);
+  // Use the logged-in ClickHouse user's visible database list.
+  const result = await client.query({
+    query: 'SHOW DATABASES',
+    format: 'JSONEachRow',
+  });
+  const rows = await result.json();
+  const names = rows
+    .map(row => row.name)
+    .filter(name => name && name !== 'information_schema');
+
+  // Enrich the list where metadata permissions allow it.
+  let metadata = new Map();
+  if (names.length) {
+    try {
+      const metaResult = await client.query({
+        query: `
+          SELECT name, engine, data_path, metadata_path, toString(uuid) AS uuid
+          FROM system.databases
+          WHERE name IN {names:Array(String)}
+        `,
+        query_params: { names },
+        format: 'JSONEachRow',
+      });
+      metadata = new Map((await metaResult.json()).map(row => [row.name, row]));
+    } catch {
+      // The visible database list still works without metadata access.
+    }
+  }
+
+  res.json(names.map(name => {
+    const meta = metadata.get(name) || {};
+    return {
+      name,
+      engine: meta.engine || 'Database',
+      data_path: meta.data_path || '',
+      metadata_path: meta.metadata_path || '',
+      uuid: meta.uuid || '',
+    };
+  }));
 }));
 
 // Get database summary with statistics
@@ -2546,35 +2971,119 @@ app.get('/api/databases/summary', asyncHandler(async (req, res) => {
     GROUP BY d.name, d.engine
     ORDER BY total_bytes DESC NULLS LAST, d.name
   `;
-  const result = await client.query({ query, format: 'JSONEachRow' });
-  const data = await result.json();
-  res.json(data);
+
+  try {
+    const result = await client.query({ query, format: 'JSONEachRow' });
+    return res.json(await result.json());
+  } catch (summaryError) {
+    // If system-table statistics aren't permitted, fall back to the
+    // logged-in user's own visible databases and tables.
+    try {
+      const dbResult = await client.query({
+        query: 'SHOW DATABASES',
+        format: 'JSONEachRow',
+      });
+      const databaseRows = await dbResult.json();
+      const fallback = [];
+
+      for (const row of databaseRows) {
+        const database = row.name;
+        if (!database || database === 'information_schema') continue;
+
+        const quotedDatabase = '`' + database.replace(/`/g, '\\`') + '`';
+        let tableCount = 0;
+
+        try {
+          const tableResult = await client.query({
+            query: `SHOW TABLES FROM ${quotedDatabase}`,
+            format: 'JSONEachRow',
+          });
+          tableCount = (await tableResult.json()).length;
+        } catch {
+          // Keep the database visible if table listing is unavailable.
+        }
+
+        fallback.push({
+          database,
+          engine: 'Database',
+          table_count: tableCount,
+          total_rows: 0,
+          total_bytes: 0,
+          partition_count: 0,
+          part_count: 0,
+          part_rows: 0,
+          bytes_on_disk: 0,
+          compressed_bytes: 0,
+          uncompressed_bytes: 0,
+          compression_ratio: 0,
+          latest_modification: '',
+        });
+      }
+
+      return res.json(fallback);
+    } catch {
+      throw summaryError;
+    }
+  }
 }));
 
 // Get tables for a database
 app.get('/api/browser/tables/:database', asyncHandler(async (req, res) => {
   const { database } = req.params;
-  const query = `
-    SELECT
-      t.name,
-      t.engine,
-      t.total_rows,
-      t.total_bytes,
-      t.metadata_modification_time,
-      COUNT(DISTINCT p.partition) AS partition_count
-    FROM system.tables t
-    LEFT JOIN system.parts p ON t.database = p.database AND t.name = p.table AND p.active = 1
-    WHERE t.database = {database:String}
-    GROUP BY t.name, t.engine, t.total_rows, t.total_bytes, t.metadata_modification_time
-    ORDER BY t.name
-  `;
-  const result = await client.query({
-    query,
-    query_params: { database },
-    format: 'JSONEachRow'
+
+  const dbResult = await client.query({
+    query: 'SHOW DATABASES',
+    format: 'JSONEachRow',
   });
-  const data = await result.json();
-  res.json(data);
+  const visibleDatabases = (await dbResult.json()).map(row => row.name);
+
+  if (!visibleDatabases.includes(database)) {
+    return res.status(404).json({ error: 'Database not found or not accessible.' });
+  }
+
+  // SHOW TABLES avoids requiring SELECT on system.parts.
+  const quotedDatabase =
+    '`' + database.replace(/`/g, '\\`') + '`';
+
+  const tableResult = await client.query({
+    query: `SHOW TABLES FROM ${quotedDatabase}`,
+    format: 'JSONEachRow',
+  });
+  const tableRows = await tableResult.json();
+  const names = tableRows.map(row => row.name).filter(Boolean);
+
+  // Add optional metadata without making it a requirement.
+  let metadata = new Map();
+  if (names.length) {
+    try {
+      const metaResult = await client.query({
+        query: `
+          SELECT name, engine, total_rows, total_bytes, metadata_modification_time
+          FROM system.tables
+          WHERE database = {database:String}
+            AND name IN {names:Array(String)}
+          ORDER BY name
+        `,
+        query_params: { database, names },
+        format: 'JSONEachRow',
+      });
+      metadata = new Map((await metaResult.json()).map(row => [row.name, row]));
+    } catch {
+      // Continue with the table names the user can see.
+    }
+  }
+
+  res.json(names.map(name => {
+    const meta = metadata.get(name) || {};
+    return {
+      name,
+      engine: meta.engine || 'Unknown',
+      total_rows: Number(meta.total_rows || 0),
+      total_bytes: Number(meta.total_bytes || 0),
+      metadata_modification_time: meta.metadata_modification_time || null,
+      partition_count: 0,
+    };
+  }));
 }));
 
 // Get partitions for a table (aggregated from system.parts)
@@ -3319,6 +3828,13 @@ app.post('/api/query', asyncHandler(async (req, res) => {
 
   // Strip trailing semicolons (ClickHouse doesn't need them and they can cause issues)
   userQuery = userQuery.trim().replace(/;+$/, '').trim();
+
+  const querySession = requestContext.getStore();
+  if (querySession && !isAdminSession(querySession) && !isReadOnlySql(userQuery)) {
+    return res.status(403).json({
+      error: 'Read-only account: only read-only SQL is allowed.',
+    });
+  }
 
   // Safety: don't allow dangerous operations
   const upperQuery = userQuery.toUpperCase();
@@ -5454,14 +5970,14 @@ async function startup() {
   // Display banner
   console.log('\n' + figlet.textSync('QueryDog', { font: 'Standard' }) + '\n');
 
-  const env = environments[activeEnvIndex];
+  const env = getCurrentEnvironment();
   const protocol = env.secure ? 'https' : 'http';
 
   // List available environments
   if (environments.length > 1) {
     console.log(`Available environments (${environments.length}):`);
     environments.forEach((e, i) => {
-      const marker = i === activeEnvIndex ? ' (active)' : '';
+      const marker = i === getCurrentEnvironmentIndex() ? ' (active)' : '';
       console.log(`  ${i + 1}. ${e.name} - ${e.host}:${e.port}${marker}`);
     });
     console.log('');

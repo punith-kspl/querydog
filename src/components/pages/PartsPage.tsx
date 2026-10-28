@@ -275,8 +275,7 @@ export function PartsPage() {
       .then(setPartitionsTotalCount)
       .catch((error: any) => {
         if (error?.status === 403 || error?.type === 'permission') {
-          console.info('Parts access denied - hiding parts/objects features');
-          setHasPartsAccess(false);
+          console.info('Optional system statistics unavailable; keeping Objects visible.');
         }
       });
   }, [partsFilters, partsSearch, setPartitionsTotalCount, setHasPartsAccess]);
@@ -289,8 +288,7 @@ export function PartsPage() {
         .then(setDatabasesData)
         .catch((error: any) => {
           if (error?.status === 403 || error?.type === 'permission') {
-            console.info('Parts access denied - hiding parts/objects features');
-            setHasPartsAccess(false);
+            console.info('Optional system statistics unavailable; keeping Objects visible.');
           }
         })
         .finally(() => setDatabasesLoading(false));
@@ -305,8 +303,7 @@ export function PartsPage() {
         .then(setGroupedData)
         .catch((error: any) => {
           if (error?.status === 403 || error?.type === 'permission') {
-            console.info('Parts access denied - hiding parts/objects features');
-            setHasPartsAccess(false);
+            console.info('Optional system statistics unavailable; keeping Objects visible.');
           }
         })
         .finally(() => setGroupedLoading(false));

@@ -9,7 +9,16 @@ const API_BASE = '/api';
 // responses use `fetch` directly.
 async function fetchJson<T>(path: string, errorPrefix: string): Promise<T> {
   const response = await fetch(`${API_BASE}${path}`);
-  if (!response.ok) throw new Error(`${errorPrefix}: ${response.statusText}`);
+  if (!response.ok) {
+    let detail = response.statusText || `HTTP ${response.status}`;
+    try {
+      const body = await response.json();
+      if (typeof body.error === 'string') detail = body.error;
+    } catch {
+      // Keep the HTTP status message if the response isn't JSON.
+    }
+    throw new Error(`${errorPrefix}: ${detail}`);
+  }
   return response.json() as Promise<T>;
 }
 
@@ -48,6 +57,15 @@ function extractConnectionError(message: string): string {
 // Transform error messages into user-friendly versions
 export function getUserFriendlyError(message: string): string {
   const cleaned = extractConnectionError(message);
+
+  // ClickHouse permission errors do not mean the backend is down.
+  const normalized = cleaned.toLowerCase();
+  if (
+    normalized.includes('not enough privileges') ||
+    normalized.includes('access_denied')
+  ) {
+    return 'Your ClickHouse account does not have permission to load this dashboard panel. Other queries allowed by your account can still work.';
+  }
 
   // Server/proxy errors indicate backend is down
   if (isServerError(cleaned)) {

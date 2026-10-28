@@ -1,5 +1,5 @@
 import { useState, useEffect, useCallback } from 'react';
-import { Dog, Database, HardDrive, Activity, Server, X, FolderTree, Terminal, FileText, Layers, FileCode, Table, AlertTriangle, Bell, Users, Network, Circle, RefreshCw, Sun, Moon } from 'lucide-react';
+import { Dog, Database, HardDrive, Activity, Server, X, FolderTree, Terminal, FileText, Layers, FileCode, Table, AlertTriangle, Bell, Users, Network, Circle, RefreshCw, Sun, Moon, LogOut } from 'lucide-react';
 import { AutoRefreshToggle } from './components/AutoRefreshToggle';
 import { QueriesPage } from './components/pages/QueriesPage';
 import { PartsPage } from './components/pages/PartsPage';
@@ -100,6 +100,25 @@ function App() {
   const [activeEnvIndex, setActiveEnvIndex] = useState(0);
   const [connectedEnvIndex, setConnectedEnvIndex] = useState<number | null>(null);
   const [environmentsFetched, setEnvironmentsFetched] = useState(false);
+  const [isAdminUser, setIsAdminUser] = useState(false);
+
+  useEffect(() => {
+    let active = true;
+    fetch('/api/auth/session', {
+      credentials: 'same-origin',
+      cache: 'no-store',
+    })
+      .then(response => response.ok ? response.json() : null)
+      .then(data => {
+        if (active) setIsAdminUser(data?.role === 'admin');
+      })
+      .catch(() => {
+        if (active) setIsAdminUser(false);
+      });
+
+    return () => { active = false; };
+  }, []);
+
   const [switching] = useState(false);
   const [connecting] = useState(false);
   const [connectingToName, setConnectingToName] = useState<string | null>(null);
@@ -348,11 +367,13 @@ function App() {
     ...(hasPartLogAccess ? [{ id: 'partlog' as const, label: 'Parts Log', icon: Layers }] : []),
     { id: 'activity', label: 'Activity', icon: Activity },
     { id: 'instance', label: 'Instance', icon: Server },
-    { id: 'textlog', label: 'Text Log', icon: FileText },
-    { id: 'users', label: 'Users', icon: Users },
-    { id: 'cluster', label: 'Cluster', icon: Network },
-    ...(hasQueriesFolder ? [{ id: 'myqueries' as const, label: 'My Queries', icon: FileCode }] : []),
-    ...(hasAlertsFolder ? [{ id: 'alerts' as const, label: 'Alerts', icon: Bell }] : []),
+    ...(isAdminUser ? [
+      { id: 'textlog' as const, label: 'Text Log', icon: FileText },
+      { id: 'users' as const, label: 'Users', icon: Users },
+      { id: 'cluster' as const, label: 'Cluster', icon: Network },
+    ] : []),
+    ...(isAdminUser && hasQueriesFolder ? [{ id: 'myqueries' as const, label: 'My Queries', icon: FileCode }] : []),
+    ...(isAdminUser && hasAlertsFolder ? [{ id: 'alerts' as const, label: 'Alerts', icon: Bell }] : []),
   ];
 
   return (
@@ -441,6 +462,24 @@ function App() {
             interval={refreshInterval}
             onIntervalChange={setRefreshInterval}
           />
+          <button
+            onClick={async () => {
+              try {
+                await fetch('/api/auth/logout', {
+                  method: 'POST',
+                  credentials: 'same-origin',
+                });
+              } catch {
+                // Redirect to login even if the server is temporarily unavailable.
+              }
+              window.location.replace('/login');
+            }}
+            className="flex items-center gap-1 px-2 py-1 bg-red-700 hover:bg-red-600 rounded text-white text-xs"
+            title="Sign out of Query Dog"
+          >
+            <LogOut className="w-3.5 h-3.5" />
+            Sign out
+          </button>
         </div>
       </header>
 
@@ -496,8 +535,8 @@ function App() {
               }
               setInitialConnectOpen(true);
             }}
-            disabled={environments.length === 0}
-            title={environments.length === 0 ? 'No environments configured' : 'Connect to database'}
+            disabled={!isAdminUser || environments.length === 0}
+            title={environments.length === 0 ? 'No environments configured' : (!isAdminUser ? 'Only administrators can change the active connection' : 'Connect to database')}
             className="bg-gray-700 border border-gray-600 rounded px-1.5 py-0.5 text-gray-300 hover:text-white hover:border-gray-500 disabled:opacity-50 disabled:cursor-not-allowed"
           >
             <Network className="w-4 h-4" />

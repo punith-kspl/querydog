@@ -556,7 +556,7 @@ export function DatabaseBrowser({ onClose }: DatabaseBrowserProps) {
   const [projectionParts, setProjectionParts] = useState<BrowserProjectionPart[]>([]);
   const [indexes, setIndexes] = useState<BrowserIndex[]>([]);
 
-  const [selectedRoot, setSelectedRoot] = useState<'databases' | 'users' | 'roles' | 'storage' | null>(null);
+  const [selectedRoot, setSelectedRoot] = useState<'databases' | 'users' | 'roles' | 'storage' | null>('databases');
   const [selectedUser, setSelectedUser] = useState<string | null>(null);
   const [selectedRole, setSelectedRole] = useState<string | null>(null);
   const [selectedDatabase, setSelectedDatabase] = useState<string | null>(null);
